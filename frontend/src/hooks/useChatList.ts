@@ -1,40 +1,21 @@
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer } from "react";
 import orderBy from "lodash/orderBy";
-
-export interface Message {
-  type: string;
-  content: string;
-  name?: string;
-  additional_kwargs?: {
-    function_call?: {
-      name?: string;
-      arguments?: string;
-    };
-  };
-  example: boolean;
-}
-
-export interface Chat {
-  assistant_id: string;
-  thread_id: string;
-  name: string;
-  updated_at: string;
-}
+import { Chat } from "../types";
 
 export interface ChatListProps {
   chats: Chat[] | null;
-  currentChat: Chat | null;
-  createChat: (
+  createChat: (name: string, assistant_id: string) => Promise<Chat>;
+  updateChat: (
     name: string,
-    assistant_id: string,
-    thread_id?: string
+    thread_id: string,
+    assistant_id: string | null,
   ) => Promise<Chat>;
-  enterChat: (id: string | null) => void;
+  deleteChat: (thread_id: string) => Promise<void>;
 }
 
 function chatsReducer(
   state: Chat[] | null,
-  action: Chat | Chat[]
+  action: Chat | Chat[],
 ): Chat[] | null {
   state = state ?? [];
   if (!Array.isArray(action)) {
@@ -49,7 +30,6 @@ function chatsReducer(
 
 export function useChatList(): ChatListProps {
   const [chats, setChats] = useReducer(chatsReducer, null);
-  const [current, setCurrent] = useState<string | null>(null);
 
   useEffect(() => {
     async function fetchChats() {
@@ -64,35 +44,54 @@ export function useChatList(): ChatListProps {
     fetchChats();
   }, []);
 
-  const createChat = useCallback(
-    async (
-      name: string,
-      assistant_id: string,
-      thread_id: string = crypto.randomUUID()
-    ) => {
-      const saved = await fetch(`/threads/${thread_id}`, {
+  const createChat = useCallback(async (name: string, assistant_id: string) => {
+    const response = await fetch(`/threads`, {
+      method: "POST",
+      body: JSON.stringify({ assistant_id, name }),
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+      },
+    });
+    const saved = await response.json();
+    setChats(saved);
+    return saved;
+  }, []);
+
+  const updateChat = useCallback(
+    async (thread_id: string, name: string, assistant_id: string | null) => {
+      const response = await fetch(`/threads/${thread_id}`, {
         method: "PUT",
         body: JSON.stringify({ assistant_id, name }),
         headers: {
           "Content-Type": "application/json",
           Accept: "application/json",
         },
-      }).then((r) => r.json());
+      });
+      const saved = await response.json();
       setChats(saved);
-      setCurrent(saved.thread_id);
       return saved;
     },
-    []
+    [],
   );
 
-  const enterChat = useCallback((id: string | null) => {
-    setCurrent(id);
-  }, []);
+  const deleteChat = useCallback(
+    async (thread_id: string) => {
+      await fetch(`/threads/${thread_id}`, {
+        method: "DELETE",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+      setChats((chats || []).filter((c: Chat) => c.thread_id !== thread_id));
+    },
+    [chats],
+  );
 
   return {
     chats,
-    currentChat: chats?.find((c) => c.thread_id === current) || null,
     createChat,
-    enterChat,
+    updateChat,
+    deleteChat,
   };
 }
