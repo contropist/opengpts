@@ -1,5 +1,6 @@
-import { useCallback, useEffect, useReducer, useState } from "react";
+import { useCallback, useEffect, useReducer } from "react";
 import orderBy from "lodash/orderBy";
+import { getAssistants } from "../api/assistants";
 
 export interface Config {
   assistant_id: string;
@@ -7,6 +8,12 @@ export interface Config {
   updated_at: string;
   config: {
     configurable?: {
+      type?: string;
+      "type==agent/tools"?: {
+        type: string;
+        name: string;
+        description: string;
+      }[];
       [key: string]: unknown;
     };
   };
@@ -16,19 +23,19 @@ export interface Config {
 
 export interface ConfigListProps {
   configs: Config[] | null;
-  currentConfig: Config | null;
   saveConfig: (
     key: string,
     config: Config["config"],
     files: File[],
-    isPublic: boolean
-  ) => Promise<void>;
-  enterConfig: (id: string | null) => void;
+    isPublic: boolean,
+    assistantId?: string,
+  ) => Promise<string>;
+  deleteConfig: (assistantId: string) => Promise<void>;
 }
 
 function configsReducer(
   state: Config[] | null,
-  action: Config | Config[]
+  action: Config | Config[],
 ): Config[] | null {
   state = state ?? [];
   if (!Array.isArray(action)) {
@@ -43,33 +50,13 @@ function configsReducer(
 
 export function useConfigList(): ConfigListProps {
   const [configs, setConfigs] = useReducer(configsReducer, null);
-  const [current, setCurrent] = useState<string | null>(null);
 
   useEffect(() => {
     async function fetchConfigs() {
-      const searchParams = new URLSearchParams(window.location.search);
-      const shared_id = searchParams.get("shared_id");
-      const [myConfigs, publicConfigs] = await Promise.all([
-        fetch("/assistants/", {
-          headers: {
-            Accept: "application/json",
-          },
-        })
-          .then((r) => r.json())
-          .then((li) => li.map((c: Config) => ({ ...c, mine: true }))),
-        fetch(
-          "/assistants/public/" + (shared_id ? `?shared_id=${shared_id}` : ""),
-          {
-            headers: {
-              Accept: "application/json",
-            },
-          }
-        ).then((r) => r.json()),
-      ]);
-      setConfigs(myConfigs.concat(publicConfigs));
-      if (publicConfigs.find((a: Config) => a.assistant_id === shared_id)) {
-        setCurrent(shared_id);
-      }
+      const assistants = await getAssistants();
+      setConfigs(
+        assistants ? assistants.map((c) => ({ ...c, mine: true })) : [],
+      );
     }
 
     fetchConfigs();
@@ -81,46 +68,57 @@ export function useConfigList(): ConfigListProps {
       config: Config["config"],
       files: File[],
       isPublic: boolean,
-      assistant_id: string = crypto.randomUUID()
-    ) => {
-      const formData = files.reduce((formData, file) => {
-        formData.append("files", file);
-        return formData;
-      }, new FormData());
-      formData.append(
-        "config",
-        JSON.stringify({ configurable: { assistant_id } })
-      );
-      const [saved] = await Promise.all([
-        fetch(`/assistants/${assistant_id}`, {
-          method: "PUT",
+      assistantId?: string,
+    ): Promise<string> => {
+      const confResponse = await fetch(
+        assistantId ? `/assistants/${assistantId}` : "/assistants",
+        {
+          method: assistantId ? "PUT" : "POST",
           body: JSON.stringify({ name, config, public: isPublic }),
           headers: {
             "Content-Type": "application/json",
             Accept: "application/json",
           },
-        }).then((r) => r.json()),
-        files.length
-          ? fetch(`/ingest`, {
-              method: "POST",
-              body: formData,
-            })
-          : Promise.resolve(),
-      ]);
-      setConfigs({ ...saved, mine: true });
-      setCurrent(saved.assistant_id);
+        },
+      );
+      const savedConfig = (await confResponse.json()) as Config;
+      if (files.length) {
+        const assistant_id = savedConfig.assistant_id;
+        const formData = files.reduce((formData, file) => {
+          formData.append("files", file);
+          return formData;
+        }, new FormData());
+        formData.append(
+          "config",
+          JSON.stringify({ configurable: { assistant_id } }),
+        );
+        await fetch(`/ingest`, {
+          method: "POST",
+          body: formData,
+        });
+      }
+      setConfigs({ ...savedConfig, mine: true });
+      return savedConfig.assistant_id;
     },
-    []
+    [],
   );
 
-  const enterConfig = useCallback((key: string | null) => {
-    setCurrent(key);
-  }, []);
+  const deleteConfig = useCallback(
+    async (assistantId: string): Promise<void> => {
+      await fetch(`/assistants/${assistantId}`, {
+        method: "DELETE",
+        headers: {
+          Accept: "application/json",
+        },
+      });
+      setConfigs((configs || []).filter((c) => c.assistant_id !== assistantId));
+    },
+    [configs],
+  );
 
   return {
     configs,
-    currentConfig: configs?.find((c) => c.assistant_id === current) || null,
     saveConfig,
-    enterConfig,
+    deleteConfig,
   };
 }

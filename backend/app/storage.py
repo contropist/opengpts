@@ -1,99 +1,44 @@
-import os
-from datetime import datetime
-from typing import List, Sequence
+from datetime import datetime, timezone
+from typing import Any, List, Optional, Sequence, Union
 
-import orjson
-from agent_executor.checkpoint import RedisCheckpoint
-from langchain.schema.messages import AnyMessage
-from langchain.utilities.redis import get_client
-from permchain.channels import Topic
-from permchain.channels.base import ChannelsManager, create_checkpoint
-from redis.client import Redis as RedisType
+from langchain_core.messages import AnyMessage
+from langchain_core.runnables import RunnableConfig
 
-from app.schema import Assistant, AssistantWithoutUserId, Thread, ThreadWithoutUserId
+from app.agent import agent
+from app.lifespan import get_pg_pool
+from app.schema import Assistant, Thread, User
 
 
-def assistants_list_key(user_id: str) -> str:
-    return f"opengpts:{user_id}:assistants"
-
-
-def assistant_key(user_id: str, assistant_id: str) -> str:
-    return f"opengpts:{user_id}:assistant:{assistant_id}"
-
-
-def threads_list_key(user_id: str) -> str:
-    return f"opengpts:{user_id}:threads"
-
-
-def thread_key(user_id: str, thread_id: str) -> str:
-    return f"opengpts:{user_id}:thread:{thread_id}"
-
-
-assistant_hash_keys = ["assistant_id", "name", "config", "updated_at", "public"]
-thread_hash_keys = ["assistant_id", "thread_id", "name", "updated_at"]
-public_user_id = "eef39817-c173-4eb6-8be4-f77cf37054fb"
-
-
-def _dump(map: dict) -> dict:
-    return {k: orjson.dumps(v) if v is not None else None for k, v in map.items()}
-
-
-def load(keys: list[str], values: list[bytes]) -> dict:
-    return {k: orjson.loads(v) if v is not None else None for k, v in zip(keys, values)}
-
-
-def _get_redis_client() -> RedisType:
-    """Get a Redis client."""
-    url = os.environ.get("REDIS_URL")
-    if not url:
-        raise ValueError("REDIS_URL not set")
-    return get_client(url)
-
-
-def list_assistants(user_id: str) -> List[Assistant]:
+async def list_assistants(user_id: str) -> List[Assistant]:
     """List all assistants for the current user."""
-    client = _get_redis_client()
-    ids = [orjson.loads(id) for id in client.smembers(assistants_list_key(user_id))]
-    with client.pipeline() as pipe:
-        for id in ids:
-            pipe.hmget(assistant_key(user_id, id), *assistant_hash_keys)
-        assistants = pipe.execute()
-    return [load(assistant_hash_keys, values) for values in assistants]
-
-
-def get_assistant(user_id: str, assistant_id: str) -> Assistant | None:
-    """Get an assistant by ID."""
-    client = _get_redis_client()
-    values = client.hmget(assistant_key(user_id, assistant_id), *assistant_hash_keys)
-    return load(assistant_hash_keys, values) if any(values) else None
-
-
-def list_public_assistants(
-    assistant_ids: Sequence[str]
-) -> List[AssistantWithoutUserId]:
-    """List all the public assistants."""
-    if not assistant_ids:
-        return []
-    client = _get_redis_client()
-    ids = [
-        id
-        for id, is_public in zip(
-            assistant_ids,
-            client.smismember(
-                assistants_list_key(public_user_id),
-                [orjson.dumps(id) for id in assistant_ids],
-            ),
+    async with get_pg_pool().acquire() as conn:
+        records = await conn.fetch(
+            "SELECT * FROM assistant WHERE user_id = $1", user_id
         )
-        if is_public
-    ]
-    with client.pipeline() as pipe:
-        for id in ids:
-            pipe.hmget(assistant_key(public_user_id, id), *assistant_hash_keys)
-        assistants = pipe.execute()
-    return [load(assistant_hash_keys, values) for values in assistants]
+        return [Assistant(**record) for record in records]
 
 
-def put_assistant(
+async def get_assistant(user_id: str, assistant_id: str) -> Optional[Assistant]:
+    """Get an assistant by ID."""
+    async with get_pg_pool().acquire() as conn:
+        record = await conn.fetchrow(
+            "SELECT * FROM assistant WHERE assistant_id = $1 AND (user_id = $2 OR public IS true)",
+            assistant_id,
+            user_id,
+        )
+        if record is None:
+            return None
+        return Assistant(**record)
+
+
+async def list_public_assistants() -> List[Assistant]:
+    """List all the public assistants."""
+    async with get_pg_pool().acquire() as conn:
+        records = await conn.fetch("SELECT * FROM assistant WHERE public IS true")
+        return [Assistant(**record) for record in records]
+
+
+async def put_assistant(
     user_id: str, assistant_id: str, *, name: str, config: dict, public: bool = False
 ) -> Assistant:
     """Modify an assistant.
@@ -108,93 +53,216 @@ def put_assistant(
     Returns:
         return the assistant model if no exception is raised.
     """
-    saved: Assistant = {
-        "user_id": user_id,  # TODO(Nuno): Could we remove this?
-        "assistant_id": assistant_id,  # TODO(Nuno): remove this?
-        "name": name,
-        "config": config,
-        "updated_at": datetime.utcnow(),
-        "public": public,
-    }
-    client = _get_redis_client()
-    with client.pipeline() as pipe:
-        pipe.sadd(assistants_list_key(user_id), orjson.dumps(assistant_id))
-        pipe.hset(assistant_key(user_id, assistant_id), mapping=_dump(saved))
-        if public:
-            pipe.sadd(assistants_list_key(public_user_id), orjson.dumps(assistant_id))
-            pipe.hset(assistant_key(public_user_id, assistant_id), mapping=_dump(saved))
-        pipe.execute()
-    return saved
-
-
-def list_threads(user_id: str) -> List[ThreadWithoutUserId]:
-    """List all threads for the current user."""
-    client = _get_redis_client()
-    ids = [orjson.loads(id) for id in client.smembers(threads_list_key(user_id))]
-    with client.pipeline() as pipe:
-        for id in ids:
-            pipe.hmget(thread_key(user_id, id), *thread_hash_keys)
-        threads = pipe.execute()
-    return [load(thread_hash_keys, values) for values in threads]
-
-
-def get_thread(user_id: str, thread_id: str) -> Thread | None:
-    """Get a thread by ID."""
-    client = _get_redis_client()
-    values = client.hmget(thread_key(user_id, thread_id), *thread_hash_keys)
-    return load(thread_hash_keys, values) if any(values) else None
-
-
-def get_thread_messages(user_id: str, thread_id: str):
-    """Get all messages for a thread."""
-    client = RedisCheckpoint()
-    checkpoint = client.get(
-        {"configurable": {"user_id": user_id, "thread_id": thread_id}}
+    updated_at = datetime.now(timezone.utc)
+    async with get_pg_pool().acquire() as conn:
+        async with conn.transaction():
+            await conn.execute(
+                (
+                    "INSERT INTO assistant (assistant_id, user_id, name, config, updated_at, public) VALUES ($1, $2, $3, $4, $5, $6) "
+                    "ON CONFLICT (assistant_id) DO UPDATE SET "
+                    "user_id = EXCLUDED.user_id, "
+                    "name = EXCLUDED.name, "
+                    "config = EXCLUDED.config, "
+                    "updated_at = EXCLUDED.updated_at, "
+                    "public = EXCLUDED.public;"
+                ),
+                assistant_id,
+                user_id,
+                name,
+                config,
+                updated_at,
+                public,
+            )
+    return Assistant(
+        assistant_id=assistant_id,
+        user_id=user_id,
+        name=name,
+        config=config,
+        updated_at=updated_at,
+        public=public,
     )
-    # TODO replace hardcoded messages channel with
-    # channel extracted from agent
-    with ChannelsManager(
-        {"messages": Topic(AnyMessage, accumulate=True)}, checkpoint
-    ) as channels:
-        return {k: v.get() for k, v in channels.items()}
 
 
-def post_thread_messages(user_id: str, thread_id: str, messages: Sequence[AnyMessage]):
-    """Add messages to a thread."""
-    client = RedisCheckpoint()
-    config = {"configurable": {"user_id": user_id, "thread_id": thread_id}}
-    checkpoint = client.get(config)
-    # TODO replace hardcoded messages channel with
-    # channel extracted from agent
-    with ChannelsManager(
-        {"messages": Topic(AnyMessage, accumulate=True)}, checkpoint
-    ) as channels:
-        channels["messages"].update(messages)
-        checkpoint = {
-            k: v for k, v in create_checkpoint(channels).items() if k == "messages"
+async def delete_assistant(user_id: str, assistant_id: str) -> None:
+    """Delete an assistant by ID."""
+    async with get_pg_pool().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM assistant WHERE assistant_id = $1 AND user_id = $2",
+            assistant_id,
+            user_id,
+        )
+
+
+async def list_threads(user_id: str) -> List[Thread]:
+    """List all threads for the current user."""
+    async with get_pg_pool().acquire() as conn:
+        records = await conn.fetch("SELECT * FROM thread WHERE user_id = $1", user_id)
+        return [Thread(**record) for record in records]
+
+
+async def get_thread(user_id: str, thread_id: str) -> Optional[Thread]:
+    """Get a thread by ID."""
+    async with get_pg_pool().acquire() as conn:
+        record = await conn.fetchrow(
+            "SELECT * FROM thread WHERE thread_id = $1 AND user_id = $2",
+            thread_id,
+            user_id,
+        )
+        if record is None:
+            return None
+        return Thread(**record)
+
+
+async def get_thread_state(*, user_id: str, thread_id: str, assistant: Assistant):
+    """Get state for a thread."""
+    state = await agent.aget_state(
+        {
+            "configurable": {
+                **assistant.config["configurable"],
+                "thread_id": thread_id,
+                "assistant_id": assistant.assistant_id,
+            }
         }
-        client.put(config, checkpoint)
+    )
+    # Keep original format - return values as is
+    values = state.values if state.values else None
 
-
-def put_thread(user_id: str, thread_id: str, *, assistant_id: str, name: str) -> Thread:
-    """Modify a thread."""
-    saved: Thread = {
-        "user_id": user_id,  # TODO(Nuno): Could we remove this?
-        "thread_id": thread_id,
-        "assistant_id": assistant_id,
-        "name": name,
-        "updated_at": datetime.utcnow(),
+    return {
+        "values": values,
+        "next": state.next,
     }
-    client = _get_redis_client()
-    with client.pipeline() as pipe:
-        pipe.sadd(threads_list_key(user_id), orjson.dumps(thread_id))
-        pipe.hset(thread_key(user_id, thread_id), mapping=_dump(saved))
-        pipe.execute()
-    return saved
 
 
-if __name__ == "__main__":
-    print(list_assistants("133"))
-    print(list_threads("123"))
-    put_assistant("123", "i-am-a-test", name="Test Agent", config={"tags": ["hello"]})
-    put_thread("123", "i-am-a-test", "test1", name="Test Thread")
+async def update_thread_state(
+    config: RunnableConfig,
+    values: Union[Sequence[AnyMessage], dict[str, Any]],
+    *,
+    user_id: str,
+    assistant: Assistant,
+):
+    """Add state to a thread."""
+    # Get the current state to determine the format
+    current_state = await agent.aget_state(
+        {
+            "configurable": {
+                **assistant.config["configurable"],
+                **config["configurable"],
+                "assistant_id": assistant.assistant_id,
+            }
+        }
+    )
+
+    # If current state is a dict (retrieval agent), maintain dict structure
+    if current_state.values and isinstance(current_state.values, dict):
+        if isinstance(values, dict):
+            state_values = values
+        else:
+            # Update just the messages in the existing state
+            state_values = {**current_state.values, "messages": values}
+    else:
+        # For message-only states (tools_agent, chatbot), just use the messages
+        state_values = (
+            values if isinstance(values, dict) and "messages" in values else values
+        )
+
+    await agent.aupdate_state(
+        {
+            "configurable": {
+                **assistant.config["configurable"],
+                **config["configurable"],
+                "assistant_id": assistant.assistant_id,
+            }
+        },
+        state_values,
+    )
+
+
+async def get_thread_history(*, user_id: str, thread_id: str, assistant: Assistant):
+    """Get the history of a thread."""
+    return [
+        {
+            "values": c.values,
+            "next": c.next,
+            "config": c.config,
+            "parent": c.parent_config,
+        }
+        async for c in agent.aget_state_history(
+            {
+                "configurable": {
+                    **assistant.config["configurable"],
+                    "thread_id": thread_id,
+                    "assistant_id": assistant.assistant_id,
+                }
+            }
+        )
+    ]
+
+
+def get_assistant_type(config: dict) -> str:
+    """Extract assistant type from config, handling both old and new formats."""
+    configurable = config.get("configurable", {})
+
+    # First try direct type key (old format)
+    if "type" in configurable:
+        return configurable["type"]
+
+    # Default fallback
+    return "chatbot"
+
+
+async def put_thread(
+    user_id: str, thread_id: str, *, assistant_id: str, name: str
+) -> Thread:
+    """Modify a thread."""
+    updated_at = datetime.now(timezone.utc)
+    assistant = await get_assistant(user_id, assistant_id)
+    metadata = (
+        {"assistant_type": get_assistant_type(assistant.config)} if assistant else None
+    )
+    async with get_pg_pool().acquire() as conn:
+        await conn.execute(
+            (
+                "INSERT INTO thread (thread_id, user_id, assistant_id, name, updated_at, metadata) VALUES ($1, $2, $3, $4, $5, $6) "
+                "ON CONFLICT (thread_id) DO UPDATE SET "
+                "user_id = EXCLUDED.user_id,"
+                "assistant_id = EXCLUDED.assistant_id, "
+                "name = EXCLUDED.name, "
+                "updated_at = EXCLUDED.updated_at, "
+                "metadata = EXCLUDED.metadata;"
+            ),
+            thread_id,
+            user_id,
+            assistant_id,
+            name,
+            updated_at,
+            metadata,
+        )
+        return Thread(
+            thread_id=thread_id,
+            user_id=user_id,
+            assistant_id=assistant_id,
+            name=name,
+            updated_at=updated_at,
+            metadata=metadata,
+        )
+
+
+async def delete_thread(user_id: str, thread_id: str):
+    """Delete a thread by ID."""
+    async with get_pg_pool().acquire() as conn:
+        await conn.execute(
+            "DELETE FROM thread WHERE thread_id = $1 AND user_id = $2",
+            thread_id,
+            user_id,
+        )
+
+
+async def get_or_create_user(sub: str) -> tuple[User, bool]:
+    """Returns a tuple of the user and a boolean indicating whether the user was created."""
+    async with get_pg_pool().acquire() as conn:
+        if record := await conn.fetchrow('SELECT * FROM "user" WHERE sub = $1', sub):
+            return User(**record), False
+        record = await conn.fetchrow(
+            'INSERT INTO "user" (sub) VALUES ($1) RETURNING *', sub
+        )
+        return User(**record), True
