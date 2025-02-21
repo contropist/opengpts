@@ -1,192 +1,135 @@
-import asyncio
-import json
-from typing import AsyncIterator, Sequence
-from uuid import uuid4
+from typing import Any, Dict, Optional, Sequence, Union
+from uuid import UUID
 
 import langsmith.client
-import orjson
-from fastapi import APIRouter, BackgroundTasks, HTTPException, Request
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi.exceptions import RequestValidationError
-from gizmo_agent import agent
-from langchain.pydantic_v1 import ValidationError
-from langchain.schema.messages import AnyMessage, FunctionMessage
-from langchain.schema.output import ChatGeneration
-from langchain.schema.runnable import RunnableConfig
-from langserve.callbacks import AsyncEventAggregatorCallback
-from langserve.schema import FeedbackCreateRequest
-from langserve.serialization import WellKnownLCSerializer
-from langserve.server import _get_base_run_id_as_str, _unpack_input
+from langchain_core.messages import AnyMessage
+from langchain_core.runnables import RunnableConfig
 from langsmith.utils import tracing_is_enabled
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from sse_starlette import EventSourceResponse
 
-from app.schema import OpengptsUserId
-from app.storage import get_assistant, get_thread_messages, public_user_id
-from app.stream import StreamMessagesHandler
+from app.agent import agent, chat_retrieval, chatbot
+from app.auth.handlers import AuthedUser
+from app.storage import get_assistant, get_thread
+from app.stream import astream_state, to_sse
 
 router = APIRouter()
-
-
-_serializer = WellKnownLCSerializer()
-
-
-class AgentInput(BaseModel):
-    """An input into an agent."""
-
-    messages: Sequence[AnyMessage] = Field(default_factory=list)
 
 
 class CreateRunPayload(BaseModel):
     """Payload for creating a run."""
 
-    assistant_id: str
     thread_id: str
-    input: AgentInput = Field(default_factory=AgentInput)
-
-
-async def _run_input_and_config(request: Request, opengpts_user_id: OpengptsUserId):
-    try:
-        body = await request.json()
-    except json.JSONDecodeError:
-        raise RequestValidationError(errors=["Invalid JSON body"])
-    assistant, public_assistant, state = await asyncio.gather(
-        asyncio.get_running_loop().run_in_executor(
-            None, get_assistant, opengpts_user_id, body["assistant_id"]
-        ),
-        asyncio.get_running_loop().run_in_executor(
-            None, get_assistant, public_user_id, body["assistant_id"]
-        ),
-        asyncio.get_running_loop().run_in_executor(
-            None, get_thread_messages, opengpts_user_id, body["thread_id"]
-        ),
+    input: Optional[Union[Sequence[AnyMessage], Dict[str, Any]]] = Field(
+        default_factory=dict
     )
-    assistant = assistant or public_assistant
+    config: Optional[RunnableConfig] = None
+
+
+async def _run_input_and_config(payload: CreateRunPayload, user_id: str):
+    thread = await get_thread(user_id, payload.thread_id)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+
+    assistant = await get_assistant(user_id, str(thread.assistant_id))
     if not assistant:
         raise HTTPException(status_code=404, detail="Assistant not found")
+
     config: RunnableConfig = {
-        **assistant["config"],
+        **assistant.config,
         "configurable": {
-            **assistant["config"]["configurable"],
-            "user_id": opengpts_user_id,
-            "thread_id": body["thread_id"],
-            "assistant_id": body["assistant_id"],
+            **assistant.config["configurable"],
+            **((payload.config or {}).get("configurable") or {}),
+            "user_id": user_id,
+            "thread_id": str(thread.thread_id),
+            "assistant_id": str(assistant.assistant_id),
         },
     }
-    try:
-        input_ = _unpack_input(agent.get_input_schema(config).validate(body["input"]))
-    except ValidationError as e:
-        raise RequestValidationError(e.errors(), body=body)
 
-    return input_, config, state["messages"]
+    try:
+        if payload.input is not None:
+            # Get the bot type from config
+            bot_type = config["configurable"].get("type", "agent")
+            # Get the correct schema based on bot type
+            if bot_type == "chat_retrieval":
+                schema = chat_retrieval.get_input_schema()
+            elif bot_type == "chatbot":
+                schema = chatbot.get_input_schema()
+            else:  # default to agent
+                schema = agent.get_input_schema()
+            # Validate against the correct schema
+            schema.model_validate(payload.input)
+    except ValidationError as e:
+        raise RequestValidationError(e.errors(), body=payload)
+
+    return payload.input, config
 
 
 @router.post("")
 async def create_run(
-    request: Request,
-    payload: CreateRunPayload,  # for openapi docs
-    opengpts_user_id: OpengptsUserId,
+    payload: CreateRunPayload,
+    user: AuthedUser,
     background_tasks: BackgroundTasks,
 ):
     """Create a run."""
-    input_, config, messages = await _run_input_and_config(request, opengpts_user_id)
+    input_, config = await _run_input_and_config(payload, user.user_id)
     background_tasks.add_task(agent.ainvoke, input_, config)
     return {"status": "ok"}  # TODO add a run id
 
 
 @router.post("/stream")
 async def stream_run(
-    request: Request,
-    payload: CreateRunPayload,  # for openapi docs
-    opengpts_user_id: OpengptsUserId,
+    payload: CreateRunPayload,
+    user: AuthedUser,
 ):
     """Create a run."""
-    input_, config, messages = await _run_input_and_config(request, opengpts_user_id)
-    streamer = StreamMessagesHandler(messages + input_["messages"])
-    event_aggregator = AsyncEventAggregatorCallback()
-    config["callbacks"] = [streamer, event_aggregator]
+    input_, config = await _run_input_and_config(payload, user.user_id)
 
-    # Call the runnable in streaming mode,
-    # add each chunk to the output stream
-    async def consume_astream() -> None:
-        try:
-            async for chunk in agent.astream(input_, config):
-                await streamer.send_stream.send(chunk)
-                # hack: function messages aren't generated by chat model
-                # so the callback handler doesn't know about them
-                if chunk["messages"]:
-                    message = chunk["messages"][-1]
-                    if isinstance(message, FunctionMessage):
-                        streamer.output[uuid4()] = ChatGeneration(message=message)
-        except Exception as e:
-            await streamer.send_stream.send(e)
-        finally:
-            await streamer.send_stream.aclose()
-
-    # Start the runnable in the background
-    task = asyncio.create_task(consume_astream())
-
-    # Consume the stream into an EventSourceResponse
-    async def _stream() -> AsyncIterator[dict]:
-        has_sent_metadata = False
-
-        async for chunk in streamer.receive_stream:
-            if isinstance(chunk, BaseException):
-                yield {
-                    "event": "error",
-                    # Do not expose the error message to the client since
-                    # the message may contain sensitive information.
-                    # We'll add client side errors for validation as well.
-                    "data": orjson.dumps(
-                        {"status_code": 500, "message": "Internal Server Error"}
-                    ).decode(),
-                }
-                raise chunk
-            else:
-                if not has_sent_metadata and event_aggregator.callback_events:
-                    yield {
-                        "event": "metadata",
-                        "data": orjson.dumps(
-                            {"run_id": _get_base_run_id_as_str(event_aggregator)}
-                        ).decode(),
-                    }
-                    has_sent_metadata = True
-
-                yield {
-                    # EventSourceResponse expects a string for data
-                    # so after serializing into bytes, we decode into utf-8
-                    # to get a string.
-                    "data": _serializer.dumps(chunk).decode("utf-8"),
-                    "event": "data",
-                }
-
-        # Send an end event to signal the end of the stream
-        yield {"event": "end"}
-        # Wait for the runnable to finish
-        await task
-
-    return EventSourceResponse(_stream())
+    return EventSourceResponse(to_sse(astream_state(agent, input_, config)))
 
 
 @router.get("/input_schema")
 async def input_schema() -> dict:
     """Return the input schema of the runnable."""
-    return agent.get_input_schema().schema()
+    return agent.get_input_schema().model_json_schema()
 
 
 @router.get("/output_schema")
 async def output_schema() -> dict:
     """Return the output schema of the runnable."""
-    return agent.get_output_schema().schema()
+    return agent.get_output_schema().model_json_schema()
 
 
 @router.get("/config_schema")
 async def config_schema() -> dict:
     """Return the config schema of the runnable."""
-    return agent.config_schema().schema()
+    return agent.config_schema().model_json_schema()
 
 
 if tracing_is_enabled():
     langsmith_client = langsmith.client.Client()
+
+    class FeedbackCreateRequest(BaseModel):
+        """
+        Shared information between create requests of feedback and feedback objects
+        """
+
+        run_id: UUID
+        """The associated run ID this feedback is logged for."""
+
+        key: str
+        """The metric name, tag, or aspect to provide feedback on."""
+
+        score: Optional[Union[float, int, bool]] = None
+        """Value or score to assign the run."""
+
+        value: Optional[Union[float, int, bool, str, Dict]] = None
+        """The display value for the feedback if not a metric."""
+
+        comment: Optional[str] = None
+        """Comment or explanation for the feedback."""
 
     @router.post("/feedback")
     def create_run_feedback(feedback_create_req: FeedbackCreateRequest) -> dict:

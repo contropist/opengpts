@@ -1,4 +1,4 @@
-from typing import Annotated, List, Sequence
+from typing import Annotated, Any, Dict, List, Optional, Sequence, Union
 from uuid import uuid4
 
 from fastapi import APIRouter, HTTPException, Path
@@ -6,7 +6,8 @@ from langchain.schema.messages import AnyMessage
 from pydantic import BaseModel, Field
 
 import app.storage as storage
-from app.schema import OpengptsUserId, Thread, ThreadWithoutUserId
+from app.auth.handlers import AuthedUser
+from app.schema import Thread
 
 router = APIRouter()
 
@@ -17,61 +18,102 @@ ThreadID = Annotated[str, Path(description="The ID of the thread.")]
 class ThreadPutRequest(BaseModel):
     """Payload for creating a thread."""
 
-    name: str = Field(..., description="The name of the thread.")
-    assistant_id: str = Field(..., description="The ID of the assistant to use.")
+    name: Annotated[str, Field(description="The name of the thread.")]
+    assistant_id: Annotated[str, Field(description="The ID of the assistant to use.")]
 
 
-class ThreadMessagesPostRequest(BaseModel):
-    """Payload for adding messages to a thread."""
+class ThreadPostRequest(BaseModel):
+    """Payload for adding state to a thread."""
 
-    messages: Sequence[AnyMessage]
+    values: Union[Sequence[AnyMessage], Dict[str, Any]]
+    config: Optional[Dict[str, Any]] = None
 
 
 @router.get("/")
-def list_threads(opengpts_user_id: OpengptsUserId) -> List[ThreadWithoutUserId]:
+async def list_threads(user: AuthedUser) -> List[Thread]:
     """List all threads for the current user."""
-    return storage.list_threads(opengpts_user_id)
+    return await storage.list_threads(user.user_id)
 
 
-@router.get("/{tid}/messages")
-def get_thread_messages(
-    opengpts_user_id: OpengptsUserId,
+@router.get("/{tid}/state")
+async def get_thread_state(
+    user: AuthedUser,
     tid: ThreadID,
 ):
-    """Get all messages for a thread."""
-    return storage.get_thread_messages(opengpts_user_id, tid)
+    """Get state for a thread."""
+    thread = await storage.get_thread(user.user_id, tid)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    assistant = await storage.get_assistant(user.user_id, thread.assistant_id)
+    if not assistant:
+        raise HTTPException(status_code=400, detail="Thread has no assistant")
+    return await storage.get_thread_state(
+        user_id=user.user_id,
+        thread_id=tid,
+        assistant=assistant,
+    )
 
 
-@router.post("/{tid}/messages")
-def add_thread_messages(
-    opengpts_user_id: OpengptsUserId,
+@router.post("/{tid}/state")
+async def add_thread_state(
+    user: AuthedUser,
     tid: ThreadID,
-    payload: ThreadMessagesPostRequest,
+    payload: ThreadPostRequest,
 ):
-    """Add messages to a thread."""
-    return storage.post_thread_messages(opengpts_user_id, tid, payload.messages)
+    """Add state to a thread."""
+    thread = await storage.get_thread(user.user_id, tid)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    assistant = await storage.get_assistant(user.user_id, thread.assistant_id)
+    if not assistant:
+        raise HTTPException(status_code=400, detail="Thread has no assistant")
+    return await storage.update_thread_state(
+        payload.config or {"configurable": {"thread_id": tid}},
+        payload.values,
+        user_id=user.user_id,
+        assistant=assistant,
+    )
+
+
+@router.get("/{tid}/history")
+async def get_thread_history(
+    user: AuthedUser,
+    tid: ThreadID,
+):
+    """Get all past states for a thread."""
+    thread = await storage.get_thread(user.user_id, tid)
+    if not thread:
+        raise HTTPException(status_code=404, detail="Thread not found")
+    assistant = await storage.get_assistant(user.user_id, thread.assistant_id)
+    if not assistant:
+        raise HTTPException(status_code=400, detail="Thread has no assistant")
+    return await storage.get_thread_history(
+        user_id=user.user_id,
+        thread_id=tid,
+        assistant=assistant,
+    )
 
 
 @router.get("/{tid}")
-def get_thread(
-    opengpts_user_id: OpengptsUserId,
+async def get_thread(
+    user: AuthedUser,
     tid: ThreadID,
 ) -> Thread:
     """Get a thread by ID."""
-    thread = storage.get_thread(opengpts_user_id, tid)
+    thread = await storage.get_thread(user.user_id, tid)
     if not thread:
         raise HTTPException(status_code=404, detail="Thread not found")
     return thread
 
 
 @router.post("")
-def create_thread(
-    opengpts_user_id: OpengptsUserId,
+async def create_thread(
+    user: AuthedUser,
     thread_put_request: ThreadPutRequest,
 ) -> Thread:
     """Create a thread."""
-    return storage.put_thread(
-        opengpts_user_id,
+    return await storage.put_thread(
+        user.user_id,
         str(uuid4()),
         assistant_id=thread_put_request.assistant_id,
         name=thread_put_request.name,
@@ -79,15 +121,25 @@ def create_thread(
 
 
 @router.put("/{tid}")
-def upsert_thread(
-    opengpts_user_id: OpengptsUserId,
+async def upsert_thread(
+    user: AuthedUser,
     tid: ThreadID,
     thread_put_request: ThreadPutRequest,
 ) -> Thread:
     """Update a thread."""
-    return storage.put_thread(
-        opengpts_user_id,
+    return await storage.put_thread(
+        user.user_id,
         tid,
         assistant_id=thread_put_request.assistant_id,
         name=thread_put_request.name,
     )
+
+
+@router.delete("/{tid}")
+async def delete_thread(
+    user: AuthedUser,
+    tid: ThreadID,
+):
+    """Delete a thread by ID."""
+    await storage.delete_thread(user.user_id, tid)
+    return {"status": "ok"}

@@ -1,7 +1,8 @@
 # OpenGPTs
 
 This is an open source effort to create a similar experience to OpenAI's GPTs and Assistants API.
-It builds upon [LangChain](https://github.com/langchain-ai/langchain), [LangServe](https://github.com/langchain-ai/langserve) and [LangSmith](https://smith.langchain.com/).
+It is powered by [LangGraph](https://github.com/langchain-ai/langgraph) - a framework for creating agent runtimes.
+It also builds upon [LangChain](https://github.com/langchain-ai/langchain), [LangServe](https://github.com/langchain-ai/langserve) and [LangSmith](https://smith.langchain.com/).
 OpenGPTs gives you more control, allowing you to configure:
 
 - The LLM you use (choose between the 60+ that LangChain offers)
@@ -11,42 +12,168 @@ OpenGPTs gives you more control, allowing you to configure:
 - The retrieval algorithm you use
 - The chat history database you use
 
+Most importantly, it gives you full control over the **cognitive architecture** of your application.
+Currently, there are three different architectures implemented:
+
+- Assistant
+- RAG
+- Chatbot
+
+See below for more details on those.
+Because this is open source, if you do not like those architectures or want to modify them, you can easily do that!
+
 <p align="center">
     <img alt="Configure" src="_static/configure.png" width="49%" />
     <img alt="Chat" src="_static/chat.png" width="49%" />
 </p>
 
 **Key Links**
+
 - [GPTs: a simple hosted version](https://opengpts-example-vz4y4ooboq-uc.a.run.app/)
 - [Assistants API: a getting started guide](API.md)
-- [Memory: how to use long-term memory](MEMORY.md)
+- [Auth: a guide for production](auth.md)
 
-## Quickstart
+## Quickstart with Docker
 
-### Start the backend
+This project supports a Docker-based setup, streamlining installation and execution. It automatically builds images for 
+the frontend and backend and sets up Postgres using docker-compose.
 
-**Install requirements**
 
+1. **Prerequisites:**  
+    Ensure you have Docker and docker-compose installed on your system.
+
+
+2. **Clone the Repository:**  
+   Obtain the project files by cloning the repository.
+
+   ```
+   git clone https://github.com/langchain-ai/opengpts.git
+   cd opengpts
+   ```
+
+3. **Set Up Environment Variables:**  
+   Create a `.env` file in the root directory of the project by copying `.env.example` as a template, and add the 
+   following environment variables:
+   ```shell
+   # At least one language model API key is required
+   OPENAI_API_KEY=sk-...
+   # LANGCHAIN_TRACING_V2=true
+   # LANGCHAIN_API_KEY=...
+   
+   # Setup for Postgres. Docker compose will use these values to set up the database.
+   POSTGRES_PORT=5432
+   POSTGRES_DB=opengpts
+   POSTGRES_USER=postgres
+   POSTGRES_PASSWORD=...
+   ```
+
+   Replace `sk-...` with your OpenAI API key and `...` with your LangChain API key.
+
+
+4. **Run with Docker Compose:**  
+   In the root directory of the project, execute:
+
+   ```
+   docker compose up
+   ```
+
+   This command builds the Docker images for the frontend and backend from their respective Dockerfiles and starts all 
+   necessary services, including Postgres.
+
+5. **Access the Application:**  
+   With the services running, access the frontend at [http://localhost:5173](http://localhost:5173), substituting `5173` with the 
+   designated port number.
+
+
+6. **Rebuilding After Changes:**  
+   If you make changes to either the frontend or backend, rebuild the Docker images to reflect these changes. Run:
+   ```
+   docker compose up --build
+   ```
+   This command rebuilds the images with your latest changes and restarts the services.
+
+
+## Quickstart without Docker
+
+**Prerequisites**
+The following instructions assume you have Python 3.11+ installed on your system. We strongly recommend using a virtual 
+environment to manage dependencies.
+
+For example, if you are using `pyenv`, you can create a new virtual environment with:
+```shell
+pyenv install 3.11
+pyenv virtualenv 3.11 opengpts
+pyenv activate opengpts
+```
+
+Once your Python environment is set up, you can install the project dependencies:
+
+The backend service uses [poetry](https://python-poetry.org/docs/#installation) to manage dependencies.
+
+```shell 
+pip install poetry
+pip install langchain-community
+```
+
+**Install Postgres and the Postgres Vector Extension**
+```
+brew install postgresql pgvector
+brew services start postgresql
+```
+
+**Configure persistence layer**
+
+The backend uses Postgres for saving agent configurations and chat message history.
+In order to use this, you need to set the following environment variables:
+
+```shell
+export POSTGRES_HOST=localhost
+export POSTGRES_PORT=5432
+export POSTGRES_DB=opengpts
+export POSTGRES_USER=postgres
+export POSTGRES_PASSWORD=...
+```
+
+**Create the database**
+```shell
+createdb opengpts
+```
+
+**Connect to the database and create the `postgres` role**
+```shell
+psql -d opengpts
+```
+
+```sql
+CREATE ROLE postgres WITH LOGIN SUPERUSER CREATEDB CREATEROLE;
+```
+
+**Install Golang Migrate**
+
+Database migrations are managed with [golang-migrate](https://github.com/golang-migrate/migrate). 
+
+On MacOS, you can install it with `brew install golang-migrate`. Instructions for other OSs or the Golang toolchain, 
+can be found [here](https://github.com/golang-migrate/migrate/blob/master/cmd/migrate/README.md#installation).
+
+Once `golang-migrate` is installed, you can run all the migrations with:
+```shell
+make migrate
+```
+
+This will enable the backend to use Postgres as a vector database and create the initial tables.
+
+
+**Install backend dependencies**
 ```shell
 cd backend
-pip install -r requirements.txt
+poetry install
 ```
 
-**Set up persistence layer**
 
-The backed by default uses Redis for saving agent configurations and chat message history.
-In order to you use this, you need to a `REDIS_URL` variable.
+**Alternate vector databases**
 
-```shell
-export REDIS_URL=...
-```
-
-**Set up vector database**
-
-The backend by default also uses Redis as a vector database,
+The instructions above use Postgres as a vector database,
 although you can easily switch this out to use any of the 50+ vector databases in LangChain.
-If you are using Redis as a vectorstore, the above environment variable should work
-(assuming you've enabled `redissearch`)
 
 **Set up language models**
 
@@ -61,6 +188,7 @@ Other language models can be used, and in order to use them you will need to set
 See the section below on `LLMs` for how to configure Azure OpenAI, Anthropic, and Amazon Bedrock.
 
 **Set up tools**
+
 By default this uses a lot of tools.
 Some of these require additional environment variables.
 You do not need to use any of these tools, and the environment variables are not required to spin up the app
@@ -82,54 +210,32 @@ export LANGCHAIN_API_KEY=...
 Start the backend server
 
 ```shell
-langchain serve --port=8100
+make start
 ```
 
-**2. Start the frontend**
+### Start the frontend
 
 ```shell
 cd frontend
-yarn
-yarn dev
+npm install
+npm run dev
 ```
 
 Navigate to [http://localhost:5173/](http://localhost:5173/) and enjoy!
 
-## Installation and Running with Docker
+## Migrating data from Redis to Postgres
 
-This project supports a Docker-based setup, streamlining installation and execution. It automatically builds images for the frontend and backend and sets up Redis using docker-compose.
+Refer to this [guide](tools/redis_to_postgres/README.md) for migrating data from Redis to Postgres.
 
-### Quick Start
+## Breaking Changes
 
-1. **Clone the Repository:**  
-   Obtain the project files by cloning the repository.
-   ```
-   git clone https://github.com/langchain-ai/opengpts.git
-   cd opengpts
-   ```
-
-2. **Run with Docker Compose:**  
-   In the root directory of the project, execute:
-   ```
-   docker compose up
-   ```
-   This command builds the Docker images for the frontend and backend from their respective Dockerfiles and starts all necessary services, including Redis.
-
-3. **Access the Application:**  
-   With the services running, access the frontend at [http://localhost:5173](http://localhost:5173), substituting `5173` with the designated port number.
-
-4. **Rebuilding After Changes:**  
-   If you make changes to either the frontend or backend, rebuild the Docker images to reflect these changes. Run:
-   ```
-   docker-compose up --build
-   ```
-   This command rebuilds the images with your latest changes and restarts the services.
-
-### Note
-- Ensure Docker and docker-compose are installed on your system.
-- Adjust the `.env` file as required for specific environment configurations.
-
----
+### Migration 5 - Checkpoint Management Update
+Version 5 of the database migrations introduces a significant change to how thread checkpoints are managed:
+- Transitions from a pickle-based checkpointing system to a new multi-table checkpoint management system (breaking change)
+- Aligns with LangGraph's new checkpoint architecture for better state management and persistence
+- **Important**: Historical threads/checkpoints (created before this migration) will not be accessible in the UI
+- Previous checkpoint data is preserved in the `old_checkpoints` table but cannot be accessed by the new system
+- This architectural change improves how thread state is stored and managed, enabling more reliable state persistence in LangGraph-based agents.
 
 ## Features
 
@@ -170,13 +276,80 @@ The big appeal of OpenGPTs as compared to using OpenAI directly is that it is mo
 Specifically, you can choose which language models to use as well as more easily add custom tools.
 You can also use the underlying APIs directly and build a custom UI yourself should you choose.
 
+### Cognitive Architecture
+
+This refers to the logic of how the GPT works.
+There are currently three different architectures supported, but because they are all written in LangGraph, it is very 
+easy to modify them or add your own.
+
+The three different architectures supported are assistants, RAG, and chatbots.
+
+**Assistants**
+
+Assistants can be equipped with arbitrary amount of tools and use an LLM to decide when to use them. This makes them 
+the most flexible choice, but they work well with fewer models and can be less reliable.
+
+When creating an assistant, you specify a few things.
+
+First, you choose the language model to use. Only a few language models can be used reliably well: GPT-3.5, GPT-4, 
+Claude, and Gemini.
+
+Second, you choose the tools to use. These can be predefined tools OR a retriever constructed from uploaded files. You 
+can choose however many you want.
+
+The cognitive architecture can then be thought of as a loop. First, the LLM is called to determine what (if any) 
+actions to take. If it decides to take actions, then those actions are executed and it loops back. If no actions are 
+decided to take, then the response of the LLM is the final response, and it finishes the loop.
+
+![](_static/agent.png)
+
+This can be a really powerful and flexible architecture. This is probably closest to how us humans operate. However, 
+these also can be not super reliable, and generally only work with the more performant models (and even then they can 
+mess up). Therefore, we introduced a few simpler architecures.
+
+Assistants are implemented with [LangGraph](https://github.com/langchain-ai/langgraph) `MessageGraph`. A `MessageGraph` is a graph that models its state as a `list` of messages.
+
+**RAGBot**
+
+One of the big use cases of the GPT store is uploading files and giving the bot knowledge of those files. What would it 
+mean to make an architecture more focused on that use case?
+
+We added RAGBot - a retrieval-focused GPT with a straightforward architecture. First, a set of documents are retrieved. 
+Then, those documents are passed in the system message to a separate call to the language model so it can respond.
+
+Compared to assistants, it is more structured (but less powerful). It ALWAYS looks up something - which is good if you 
+know you want to look things up, but potentially wasteful if the user is just trying to have a normal conversation. 
+Also importantly, this only looks up things once - so if it doesn't find the right results then it will yield a bad 
+result (compared to an assistant, which could  decide to look things up again).
+
+![](_static/rag.png)
+
+Despite this being a more simple architecture, it is good for a few reasons. First, because it is simpler it can work 
+pretty well with a wider variety of models (including lots of open source models). Second, if you have a use case where 
+you don't NEED the flexibility of an assistant (eg you know users will be looking up information every time) then it 
+can be more focused. And third, compared to the final architecture below it can use external knowledge.
+
+RAGBot is implemented with [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. A `StateGraph` is a generalized graph that can model arbitrary state (i.e. `dict`), not just a `list` of messages.
+
+**ChatBot**
+
+The final architecture is dead simple - just a call to a language model, parameterized by a system message. This allows 
+the GPT to take on different personas and characters. This is clearly far less powerful than Assistants or RAGBots 
+(which have access to external sources of data/computation) - but it's still valuable! A lot of popular GPTs are just 
+system messages at the end of the day, and CharacterAI is crushing it despite largely just being system messages as 
+well.
+
+![](_static/chatbot.png)
+
+ChatBot is implemented with [LangGraph](https://github.com/langchain-ai/langgraph) `StateGraph`. A `StateGraph` is a generalized graph that can model arbitrary state (i.e. `dict`), not just a `list` of messages.
+
 ### LLMs
 
 You can choose between different LLMs to use.
 This takes advantage of LangChain's many integrations.
 It is important to note that depending on which LLM you use, you may need to change how you are prompting it.
 
-We have expose four agent types by default:
+We have exposed four agent types by default:
 
 - "GPT 3.5 Turbo"
 - "GPT 4"
@@ -185,7 +358,8 @@ We have expose four agent types by default:
 
 We will work to add more when we have confidence they can work well.
 
-If you want to add your own LLM or agent configuration, or want to edit the existing ones, you can find them in `backend/packages/gizmo-agent/gizmo_agent/agent_types`
+If you want to add your own LLM or agent configuration, or want to edit the existing ones, you can find them in 
+`backend/app/agent_types`
 
 #### Claude 2
 
@@ -208,7 +382,8 @@ export AZURE_OPENAI_DEPLOYMENT_NAME=...
 
 #### Amazon Bedrock
 
-If using Amazon Bedrock, you either have valid credentials in `~/.aws/credentials` or set the following environment variables:
+If using Amazon Bedrock, you either have valid credentials in `~/.aws/credentials` or set the following environment 
+variables:
 
 ```shell
 export AWS_ACCESS_KEY_ID=...
@@ -221,9 +396,27 @@ One of the big benefits of having this be open source is that you can more easil
 
 In practice, most teams we see define their own tools.
 This is easy to do within LangChain.
-See [this guide](https://python.langchain.com/docs/modules/agents/tools/custom_tools) for details on how to best do this.
+See [this guide](https://python.langchain.com/docs/modules/agents/tools/custom_tools) for details on how to best do 
+this.
 
 If you want to use some preconfigured tools, these include:
+
+**_Sema4.ai Action Server_**
+
+Run AI Python based actions with [Sema4.ai Action Server](https://github.com/Sema4AI/actions).
+Does not require a service API key, but it requires the credentials for a running Action Server instance to be defined.
+These you set while creating an assistant.
+
+**_Connery Actions_**
+
+Connect OpenGPTs to the real world with [Connery](https://github.com/connery-io/connery).
+
+Requires setting an environment variable, which you get during the [Connery Runner setup](https://docs.connery.io/docs/runner/quick-start/):
+
+```shell
+CONNERY_RUNNER_URL=https://your-personal-connery-runner-url
+CONNERY_RUNNER_API_KEY=...
+```
 
 **DuckDuckGo Search**
 
@@ -299,6 +492,8 @@ Searches [Wikipedia](https://pypi.org/project/wikipedia/). Does not require any 
 
 ## Deployment
 
+### Deploy via Cloud Run
+
 **1. Build the frontend**
 
 ```shell
@@ -314,5 +509,11 @@ You can deploy to GCP Cloud Run using the following command:
 First create a `.env.gcp.yaml` file with the contents from `.env.gcp.yaml.example` and fill in the values. Then run:
 
 ```shell
-gcloud run deploy opengpts --source . --port 8001 --env-vars-file .env.gcp.yaml --allow-unauthenticated --region us-central1 --min-instances 1
+gcloud run deploy opengpts --source . --port 8000 --env-vars-file .env.gcp.yaml --allow-unauthenticated \
+--region us-central1 --min-instances 1
 ```
+
+### Deploy in Kubernetes
+
+We have a Helm chart for deploying the backend to Kubernetes. You can find more information here: 
+[README.md](https://github.com/langchain-ai/helm/tree/main/charts/open-gpts)
